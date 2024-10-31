@@ -7,7 +7,7 @@ User options
 """
 
 #Variable assignment
-DEMLayer            = 'D:/Other Tasks/Conifers/Spat Data/MergedPointCloudDEM_50cmClipped.tif'
+DEMLayer            = 'C:/Temp/DEM.tif'
 iterations          = 160
 noiseLevel          = 0.15
 
