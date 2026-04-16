@@ -4,6 +4,9 @@ from qgis.core import (QgsProcessingAlgorithm, QgsProcessingParameterRasterLayer
     QgsColorRampShader, Qgis, QgsProcessingParameterNumber, QgsCoordinateReferenceSystem)
 from qgis import processing
 from PyQt5.QtGui import QColor
+import numpy as np
+from osgeo import gdal
+from scipy.ndimage import minimum_filter
 
 #Define the class to grab the qgsprocessing stuff
 class QGISWetnessIndex(QgsProcessingAlgorithm):
@@ -16,7 +19,7 @@ class QGISWetnessIndex(QgsProcessingAlgorithm):
         
         #Ask how many iterations they want to do
         self.addParameter(QgsProcessingParameterNumber(
-            "iterations","Number of iterations (best start small)",type=QgsProcessingParameterNumber.Integer,defaultValue=3,minValue=1))
+            "iterations","Number of iterations (best start small)",type=QgsProcessingParameterNumber.Integer,defaultValue=1,minValue=1))
         
         #Ask how much noise to apply to the DEM
         self.addParameter(QgsProcessingParameterNumber(
@@ -119,19 +122,84 @@ class QGISWetnessIndex(QgsProcessingAlgorithm):
                         'FORMULA':'A+B','NO_DATA':None,'EXTENT_OPT':0,'PROJWIN':None,'RTYPE':5,'OPTIONS':compressOptions,
                         'EXTRA':'','OUTPUT':'TEMPORARY_OUTPUT'})['OUTPUT']
 
-            #The final wetness follows this formula: log(flowAccumulation / tan(slope))  https://en.wikipedia.org/wiki/Topographic_wetness_index
+            #The wetness follows this formula: log(flowAccumulation / tan(slope))  https://en.wikipedia.org/wiki/Topographic_wetness_index
             wetnessLayerPath = processing.run("gdal:rastercalculator", {'INPUT_A':flowSoFarLayer,'BAND_A':1,'INPUT_B':smoothedDEMSlope,'BAND_B':1,
                 'FORMULA':'log(A/((numpy.tan(numpy.deg2rad(B))+0.1))/' + str(iterations) + ')','NO_DATA':None,
                 'EXTENT_OPT':0,'PROJWIN':None,'RTYPE':5,'OPTIONS':compressOptions,'EXTRA':'','OUTPUT':'TEMPORARY_OUTPUT'})['OUTPUT']
+            wetnessLayer = QgsRasterLayer(wetnessLayerPath, "Wetness Index")
                 
+            """
+            #######################################################################
+            Spreading wetness across flat areas
+            """
+            
+            #Turn the layers into numpy arrays
+            wetnessDataset = gdal.Open(wetnessLayer.source())
+            wetnessGrid = wetnessDataset.GetRasterBand(1).ReadAsArray()
+            demDataset = gdal.Open(inputDEMLayer.source())
+            elevationGrid = demDataset.GetRasterBand(1).ReadAsArray()
+
+            #Variables that can be adjusted if we want different behaviour
+            pixelSizeMeters = 10
+            neighbourhoodSizePixels = 8
+            halfWindow = neighbourhoodSizePixels // 2
+
+            #Build the neighbourhood offsets we use for scanning around each cell within the numpy array
+            yOffsets, xOffsets = np.meshgrid(
+                np.arange(-halfWindow, halfWindow + 1),
+                np.arange(-halfWindow, halfWindow + 1),
+                indexing='ij')
+            offsetPairs = np.stack([yOffsets.ravel(), xOffsets.ravel()], axis=1)
+
+            #Pad the wetness grid so edges don't break the neighbourhood search
+            rows, cols = wetnessGrid.shape
+            paddedWetness = np.pad(wetnessGrid, halfWindow, mode='edge')
+
+            #Find the strongest nearby wetness value with distance decay applied
+            bestWetness = np.full(wetnessGrid.shape, -np.inf)
+
+            #Shift the entire grid around in different offsets to find the most significant close wetness
+            for yOffset, xOffset in offsetPairs:
+                distanceMeters = np.sqrt(yOffset**2 + xOffset**2) * pixelSizeMeters
+                shiftedWetness = paddedWetness[
+                    halfWindow + yOffset:halfWindow + yOffset + rows,
+                    halfWindow + xOffset:halfWindow + xOffset + cols]
+
+                #The -0.025 here controls how much the further pixels are devalued for being far away
+                decayedWetness = shiftedWetness * np.exp(-0.025 * distanceMeters)
+                updateMask = decayedWetness > bestWetness
+                bestWetness[updateMask] = decayedWetness[updateMask]
+
+            #Find local low points in the terrain surface
+            localLowPoints = minimum_filter(elevationGrid, size=neighbourhoodSizePixels, mode='nearest')
+            heightAboveLowPoints = np.maximum(elevationGrid - localLowPoints, 0)
+
+            #Combine wetness signal with terrain penalty
+            finalWetnessArray = np.maximum(bestWetness * np.exp(-0.25 * heightAboveLowPoints), wetnessGrid)
+
+            #Prep some stuff to turn a numpy array into a memory raster layer
+            gridRowCount, gridColumnCount = finalWetnessArray.shape
+            geoTransformMatrixForRaster = [inputDEMLayerBounds.xMinimum(), inputDEMLayerBounds.width() / gridColumnCount, 0,
+                inputDEMLayerBounds.yMaximum(), 0, -inputDEMLayerBounds.height() / gridRowCount]
+            temporaryRasterFilePath = "/vsimem/" + "Final wetness" + ".tif"
+            geoTiffDriverForRasterWriting = gdal.GetDriverByName("GTiff")
+
+            #Actually turn a numpy array into a memory raster layer
+            geoTiffDatasetBeingBuilt = geoTiffDriverForRasterWriting.Create(temporaryRasterFilePath, gridColumnCount, gridRowCount, 1, gdal.GDT_Float32)
+            geoTiffDatasetBeingBuilt.SetGeoTransform(geoTransformMatrixForRaster)
+            geoTiffDatasetBeingBuilt.SetProjection(inputDEMLayer.crs().toWkt())
+            geoTiffDatasetBeingBuilt.GetRasterBand(1).WriteArray(finalWetnessArray)
+            geoTiffDatasetBeingBuilt.FlushCache()
+            geoTiffDatasetBeingBuilt = None
+
             """
             #######################################################################
             Styling
             """
 
             #Add in the wetness layer
-            wetnessLayer = QgsRasterLayer(wetnessLayerPath, "Wetness Index")
-            QgsProject.instance().addMapLayer(wetnessLayer)
+            finalWetnessLayer = QgsRasterLayer(temporaryRasterFilePath, "Final wetness")
+            QgsProject.instance().addMapLayer(finalWetnessLayer)
 
             #Begin creating a colour ramp
             colorRampShader = QgsColorRampShader()
@@ -151,9 +219,9 @@ class QGISWetnessIndex(QgsProcessingAlgorithm):
             #Apply the colouring
             rasterShader = QgsRasterShader()
             rasterShader.setRasterShaderFunction(colorRampShader)
-            renderer = QgsSingleBandPseudoColorRenderer(wetnessLayer.dataProvider(), 1, rasterShader)
-            wetnessLayer.setRenderer(renderer)
-            wetnessLayer.triggerRepaint()
+            renderer = QgsSingleBandPseudoColorRenderer(finalWetnessLayer.dataProvider(), 1, rasterShader)
+            finalWetnessLayer.setRenderer(renderer)
+            finalWetnessLayer.triggerRepaint()
 
             """
             ############################################################################################
